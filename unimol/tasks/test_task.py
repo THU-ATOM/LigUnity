@@ -1328,3 +1328,187 @@ class ContrasRankTest(UnicoreTask):
             os.mkdir(write_dir)
         np.save(f"{write_dir}/bdb_pocket_reps.npy", pocket_reps)
         json.dump(pocket_names, open(f"{write_dir}/bdb_pocket_names.json", "w"))
+
+    def forward_inference(self, model):
+        """
+        Unified inference method for virtual screening
+        
+        This method reads target information from INPUT_JSON environment variable,
+        processes each target, and saves results to RESULTS_PATH.
+        
+        Compatible with any dataset format (DUDE, LIT-PCBA, etc.)
+        """
+        print("="*80, flush=True)
+        print("Starting LigUnity inference", flush=True)
+        print("="*80, flush=True)
+
+        data_dir = "/data/data/"
+        print(f"Checking data directory: {data_dir}", flush=True)
+        
+        if not os.path.exists(data_dir):
+            print(f"Error: Data directory not found: {data_dir}", flush=True)
+            raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        
+        # Check if INPUT_JSON environment variable is set
+        input_json_path = os.environ.get('INPUT_JSON')
+        if input_json_path and os.path.exists(input_json_path):
+            print(f"Using targets from INPUT_JSON: {input_json_path}", flush=True)
+            import json
+            with open(input_json_path, 'r') as f:
+                input_data = json.load(f)
+            targets = [item['name'] for item in input_data]
+            print(f"Read {len(targets)} targets from INPUT_JSON", flush=True)
+        else:
+            # Get all targets from directory
+            targets = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
+            print(f"Found {len(targets)} targets by scanning directory", flush=True)
+        
+        if not targets:
+            print(f"Error: No targets found", flush=True)
+            raise ValueError(f"No targets found")
+        
+        print(f"Target list: {targets}", flush=True)
+        
+        # Process each target
+        for i, target in enumerate(targets):
+            print(f"\n{'='*60}", flush=True)
+            print(f"Processing target [{i+1}/{len(targets)}]: {target}", flush=True)
+            print(f"{'='*60}", flush=True)
+            
+            try:
+                scores, labels, mol_names = self.forward_single_target(target, model)
+                print(f"✓ Target {target} processed successfully", flush=True)
+                print(f"  - Number of molecules: {len(mol_names)}", flush=True)
+                print(f"  - Score range: [{scores.min():.4f}, {scores.max():.4f}]", flush=True)
+                if labels is not None:
+                    print(f"  - Label info: actives={np.sum(labels)}, decoys={len(labels)-np.sum(labels)}", flush=True)
+            except Exception as e:
+                print(f"✗ Target {target} processing failed: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print("\n" + "="*80, flush=True)
+        print("All targets processing completed!", flush=True)
+        print("="*80, flush=True)
+
+    def forward_single_target(self, target_name, model):
+        """
+        Process a single target for virtual screening
+        
+        Args:
+            target_name: Name of the target
+            model: LigUnity model
+            
+        Returns:
+            scores: Array of affinity scores
+            labels: Array of labels (1=active, 0=decoy) or None
+            mol_names: List of molecule names
+        """
+        bsz = 8
+        
+        # 1. Load molecule data from LMDB
+        mol_lmdb_path = f"/data/data/{target_name}/mols.lmdb"
+        print(f"  Loading molecule data: {mol_lmdb_path}", flush=True)
+        
+        if not os.path.exists(mol_lmdb_path):
+            print(f"  Error: Molecule LMDB not found: {mol_lmdb_path}", flush=True)
+            raise FileNotFoundError(f"Molecule LMDB not found: {mol_lmdb_path}")
+        
+        mol_dataset = self.load_mols_dataset(mol_lmdb_path, "atoms", "coordinates")
+        mol_data = torch.utils.data.DataLoader(mol_dataset, batch_size=bsz, num_workers=0,
+                                               collate_fn=mol_dataset.collater)
+        
+        # 2. Encode molecules
+        mol_reps = []
+        mol_names = []
+        labels = []
+        print(f"  Starting molecule encoding...", flush=True)
+        
+        for batch_idx, sample in enumerate(tqdm(mol_data, desc="Encoding molecules")):
+            sample = unicore.utils.move_to_cuda(sample)
+            mol_emb = model.mol_forward(**sample["net_input"])
+            mol_emb = mol_emb.detach().cpu().numpy()
+            
+            mol_reps.append(mol_emb)
+            mol_names.extend(sample["smi_name"])
+            
+            # Try to get labels if available
+            if "target" in sample:
+                labels.extend(sample["target"].detach().cpu().numpy())
+        
+        mol_reps = np.concatenate(mol_reps, axis=0)
+        labels = np.array(labels, dtype=np.int32) if labels else None
+        
+        # 3. Load pocket data from LMDB
+        pocket_lmdb_path = f"/data/data/{target_name}/pocket.lmdb"
+        print(f"  Loading pocket data: {pocket_lmdb_path}", flush=True)
+        
+        if not os.path.exists(pocket_lmdb_path):
+            print(f"  Error: Pocket LMDB not found: {pocket_lmdb_path}", flush=True)
+            raise FileNotFoundError(f"Pocket LMDB not found: {pocket_lmdb_path}")
+        
+        pocket_dataset = self.load_pockets_dataset(pocket_lmdb_path)
+        pocket_data = torch.utils.data.DataLoader(pocket_dataset, batch_size=bsz, num_workers=0,
+                                                  collate_fn=pocket_dataset.collater)
+        
+        # 4. Get protein sequence (if available from INPUT_JSON)
+        input_json_path = os.environ.get('INPUT_JSON')
+        seq = ""
+        if input_json_path and os.path.exists(input_json_path):
+            import json
+            with open(input_json_path, 'r') as f:
+                input_data = json.load(f)
+            for item in input_data:
+                if item['name'] == target_name:
+                    seq = item.get('sequence', '')
+                    break
+        
+        if seq:
+            print(f"  Using protein sequence from INPUT_JSON", flush=True)
+        else:
+            print(f"  Warning: No protein sequence provided", flush=True)
+        
+        # 5. Encode pockets
+        pocket_reps = []
+        print(f"  Starting pocket encoding...", flush=True)
+        
+        for batch_idx, sample in enumerate(tqdm(pocket_data, desc="Encoding pockets")):
+            sample = unicore.utils.move_to_cuda(sample)
+            pocket_emb = model.pocket_forward(protein_sequences=seq, **sample["net_input"])
+            pocket_emb = pocket_emb.detach().cpu().numpy()
+            pocket_reps.append(pocket_emb)
+        
+        pocket_reps = np.concatenate(pocket_reps, axis=0)
+        print(f"  Pocket representation shape: {pocket_reps.shape}", flush=True)
+        
+        # 6. Calculate similarity scores
+        print(f"  Calculating molecule-pocket similarity...", flush=True)
+        similarity_matrix = pocket_reps @ mol_reps.T
+        scores = similarity_matrix.max(axis=0)  # Take max similarity for each molecule
+        
+        # 7. Save results
+        result_data = {
+            'target': target_name,
+            'scores': scores.tolist(),
+            'mol_names': mol_names
+        }
+        
+        # If labels available, also save them
+        if labels is not None:
+            result_data['labels'] = labels.tolist()
+            print(f"  Label statistics - actives: {np.sum(labels)}, decoys: {len(labels)-np.sum(labels)}", flush=True)
+        
+        output_dir = "/data/output"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        output_file = f"{output_dir}/{target_name}.json"
+        print(f"  Saving prediction results to: {output_file}", flush=True)
+        
+        import json
+        with open(output_file, 'w') as f:
+            json.dump(result_data, f, indent=2)
+        
+        print(f"  Target {target_name} processing completed!", flush=True)
+        
+        return scores, labels, mol_names

@@ -1,0 +1,30 @@
+# PyTorch with CUDA 11.8 support
+torch==2.1.0
+torchvision==0.16.0
+torchaudio==2.1.0
+
+# Scientific computing
+numpy==1.24.3
+scipy
+pandas
+
+# Chemistry
+rdkit
+
+# Machine learning
+scikit-learn
+fairseq
+
+# Bioinformatics
+biopython
+biopandas
+fair-esm
+
+# NLP (compatible with PyTorch 2.1.0)
+transformers==4.31.0
+
+# Utilities
+tqdm
+lmdb
+
+# Note: unicore will be installed via Uni-Core git installation

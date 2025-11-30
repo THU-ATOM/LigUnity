@@ -24,10 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("unimol.inference")
 
-# from skchem.metrics import bedroc_score
-from rdkit.ML.Scoring.Scoring import CalcBEDROC, CalcAUC, CalcEnrichment
-from sklearn.metrics import roc_curve
-
 
 def main(args):
     use_fp16 = args.fp16
@@ -53,50 +49,32 @@ def main(args):
     logger.info(args)
 
     model.eval()
+    
+    # Use unified forward_inference() interface
     with torch.no_grad():
-        if args.test_task == "DUDE":
-            task.test_dude(model)
-
-        elif args.test_task == "CASF":
-            task.inference_pdbbind(model, "test")
-
-        elif args.test_task == "PCBA":
-            task.test_pcba(model)
-
-        elif args.test_task == "PDB":
-            task.inference_pdbbind(model, "test")
-            task.inference_pdbbind(model, "train")
-
-        elif args.test_task == "FEP":
-            task.test_fep(model)
-
-        elif args.test_task == "DEKOIS":
-            task.test_dekois(model)
-
-        elif args.test_task == "DEMO":
-            task.test_demo(model)
-
-        elif args.test_task == "BDB":
-            task.test_bdb_lig(model)
-            task.test_bdb_pocket(model)
-
-        elif args.test_task == "ALL":
-            task.test_fep(model)
-            task.test_dude(model)
-            task.test_dekois(model)
-            task.test_pcba(model)
+        logger.info("Running forward inference...")
+        task.forward_inference(model)
+        logger.info("Forward inference completed")
 
 
 def cli_main():
     # add args
-
     parser = options.get_validation_parser()
-    parser.add_argument("--test-task", type=str, default="DUDE", help="test task",
-                        choices=["DUDE", "PCBA", "CASF", "PDB", "FEP", "BDB", "DEKOIS", "ALL", "DEMO"])
+    parser.add_argument("--input-json", type=str, default=None, help="Input JSON file path")
+    parser.add_argument("--weight-path", type=str, default=None, help="Model checkpoint path")
     options.add_model_args(parser)
     args = options.parse_args_and_arch(parser)
 
+    # Override path with weight-path if provided (for compatibility)
+    if args.weight_path:
+        args.path = args.weight_path
+
     distributed_utils.call_main(args, main)
+
+
+if __name__ == "__main__":
+    cli_main()
+
 
 
 if __name__ == "__main__":
