@@ -1342,25 +1342,39 @@ class ContrasRankTest(UnicoreTask):
         print("Starting LigUnity inference", flush=True)
         print("="*80, flush=True)
 
-        data_dir = "/data/data/"
-        print(f"Checking data directory: {data_dir}", flush=True)
-        
-        if not os.path.exists(data_dir):
-            print(f"Error: Data directory not found: {data_dir}", flush=True)
-            raise FileNotFoundError(f"Data directory not found: {data_dir}")
-        
         # Check if INPUT_JSON environment variable is set
         input_json_path = os.environ.get('INPUT_JSON')
+        target_data_dirs = {}  # Store data directory for each target
+        
         if input_json_path and os.path.exists(input_json_path):
             print(f"Using targets from INPUT_JSON: {input_json_path}", flush=True)
             import json
             with open(input_json_path, 'r') as f:
                 input_data = json.load(f)
-            targets = [item['name'] for item in input_data]
+            targets = []
+            for item in input_data:
+                target_name = item['name']
+                targets.append(target_name)
+                # Infer data directory from input paths
+                base_file = item.get('pocket_path') or item.get('receptor_path') or item.get('actives_path') or item.get('decoys_path')
+                if base_file:
+                    from pathlib import Path
+                    target_data_dirs[target_name] = str(Path(base_file).parent)
+                else:
+                    target_data_dirs[target_name] = f"/data/data/{target_name}"
             print(f"Read {len(targets)} targets from INPUT_JSON", flush=True)
         else:
-            # Get all targets from directory
+            # Get all targets from directory (original logic)
+            data_dir = "/data/data/"
+            print(f"Checking data directory: {data_dir}", flush=True)
+            
+            if not os.path.exists(data_dir):
+                print(f"Error: Data directory not found: {data_dir}", flush=True)
+                raise FileNotFoundError(f"Data directory not found: {data_dir}")
+            
             targets = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
+            for t in targets:
+                target_data_dirs[t] = os.path.join(data_dir, t)
             print(f"Found {len(targets)} targets by scanning directory", flush=True)
         
         if not targets:
@@ -1368,6 +1382,8 @@ class ContrasRankTest(UnicoreTask):
             raise ValueError(f"No targets found")
         
         print(f"Target list: {targets}", flush=True)
+        for t in targets:
+            print(f"  - {t}: {target_data_dirs.get(t, 'unknown')}", flush=True)
         
         # Process each target
         for i, target in enumerate(targets):
@@ -1376,7 +1392,8 @@ class ContrasRankTest(UnicoreTask):
             print(f"{'='*60}", flush=True)
             
             try:
-                scores, labels, mol_names = self.forward_single_target(target, model)
+                data_dir = target_data_dirs.get(target)
+                scores, labels, mol_names = self.forward_single_target(target, model, data_dir=data_dir)
                 print(f"✓ Target {target} processed successfully", flush=True)
                 print(f"  - Number of molecules: {len(mol_names)}", flush=True)
                 print(f"  - Score range: [{scores.min():.4f}, {scores.max():.4f}]", flush=True)
@@ -1392,13 +1409,14 @@ class ContrasRankTest(UnicoreTask):
         print("All targets processing completed!", flush=True)
         print("="*80, flush=True)
 
-    def forward_single_target(self, target_name, model):
+    def forward_single_target(self, target_name, model, data_dir=None):
         """
         Process a single target for virtual screening
         
         Args:
             target_name: Name of the target
             model: LigUnity model
+            data_dir: Data directory path (if None, use default path)
             
         Returns:
             scores: Array of affinity scores
@@ -1407,8 +1425,12 @@ class ContrasRankTest(UnicoreTask):
         """
         bsz = 8
         
+        # Use provided data directory or default path
+        if data_dir is None:
+            data_dir = f"/data/data/{target_name}"
+        
         # 1. Load molecule data from LMDB
-        mol_lmdb_path = f"/data/data/{target_name}/mols.lmdb"
+        mol_lmdb_path = f"{data_dir}/mols.lmdb"
         print(f"  Loading molecule data: {mol_lmdb_path}", flush=True)
         
         if not os.path.exists(mol_lmdb_path):
@@ -1441,7 +1463,7 @@ class ContrasRankTest(UnicoreTask):
         labels = np.array(labels, dtype=np.int32) if labels else None
         
         # 3. Load pocket data from LMDB
-        pocket_lmdb_path = f"/data/data/{target_name}/pocket.lmdb"
+        pocket_lmdb_path = f"{data_dir}/pocket.lmdb"
         print(f"  Loading pocket data: {pocket_lmdb_path}", flush=True)
         
         if not os.path.exists(pocket_lmdb_path):
@@ -1499,7 +1521,8 @@ class ContrasRankTest(UnicoreTask):
             result_data['labels'] = labels.tolist()
             print(f"  Label statistics - actives: {np.sum(labels)}, decoys: {len(labels)-np.sum(labels)}", flush=True)
         
-        output_dir = "/data/output"
+        # Use RESULTS_PATH environment variable, fallback to data_dir
+        output_dir = os.environ.get('RESULTS_PATH', data_dir)
         os.makedirs(output_dir, exist_ok=True)
         
         output_file = f"{output_dir}/{target_name}.json"
